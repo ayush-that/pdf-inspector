@@ -1,8 +1,8 @@
 """Tests for the pdf_inspector Python bindings."""
 
 import os
+import sys
 import threading
-import time
 import pytest
 import pdf_inspector
 
@@ -413,27 +413,30 @@ class TestMultipleFixtures:
 class TestGilRelease:
     def test_extract_pages_markdown_releases_the_gil(self):
         """A parse must not stall every other thread in the process."""
-        ticks = 0
-        stop = False
+        path = fixture_path("2013-app2.pdf")
+        unblocked = threading.Event()
+        progressed = threading.Event()
 
-        def tick():
-            nonlocal ticks
-            while not stop:
-                ticks += 1
-                time.sleep(0.001)
+        def worker():
+            unblocked.wait()
+            progressed.set()
 
-        thread = threading.Thread(target=tick)
+        thread = threading.Thread(target=worker)
         thread.start()
+        # A long switch interval keeps this thread from being preempted
+        # between set() and the check after the parse, so the worker can only
+        # wake up if the parse itself releases the GIL.
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(60)
         try:
-            time.sleep(0.2)
-            before = ticks
-            pdf_inspector.extract_pages_markdown(fixture_path("2013-app2.pdf"))
-            during = ticks - before
+            unblocked.set()
+            pdf_inspector.extract_pages_markdown(path)
+            ran_during_parse = progressed.is_set()
         finally:
-            stop = True
+            sys.setswitchinterval(interval)
             thread.join()
 
-        assert during > 5, (
-            f"ticker advanced {during} times during the parse; "
+        assert ran_during_parse, (
+            "the worker thread never woke during the parse; "
             "the GIL is held for its duration"
         )
