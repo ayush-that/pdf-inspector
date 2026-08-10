@@ -1,6 +1,8 @@
 """Tests for the pdf_inspector Python bindings."""
 
 import os
+import threading
+import time
 import pytest
 import pdf_inspector
 
@@ -401,3 +403,37 @@ class TestMultipleFixtures:
         )
         assert result.page_count > 0
         assert result.confidence >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# GIL
+# ---------------------------------------------------------------------------
+
+
+class TestGilRelease:
+    def test_extract_pages_markdown_releases_the_gil(self):
+        """A parse must not stall every other thread in the process."""
+        ticks = 0
+        stop = False
+
+        def tick():
+            nonlocal ticks
+            while not stop:
+                ticks += 1
+                time.sleep(0.001)
+
+        thread = threading.Thread(target=tick)
+        thread.start()
+        try:
+            time.sleep(0.2)
+            before = ticks
+            pdf_inspector.extract_pages_markdown(fixture_path("2013-app2.pdf"))
+            during = ticks - before
+        finally:
+            stop = True
+            thread.join()
+
+        assert during > 5, (
+            f"ticker advanced {during} times during the parse; "
+            "the GIL is held for its duration"
+        )

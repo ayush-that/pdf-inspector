@@ -437,38 +437,52 @@ fn convert_region_results(results: Vec<crate::PageRegionResult>) -> Vec<PyPageRe
 /// Process a PDF file: detect type, extract text, and convert to Markdown.
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
-fn process_pdf(path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
+fn process_pdf(py: Python<'_>, path: &str, pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
     let mut opts = crate::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
-    let result = crate::process_pdf_with_options(path, opts).map_err(to_py_err)?;
+    let result = py
+        .allow_threads(|| crate::process_pdf_with_options(path, opts))
+        .map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Process a PDF from bytes in memory.
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
-fn process_pdf_bytes(data: &[u8], pages: Option<Vec<u32>>) -> PyResult<PyPdfResult> {
+fn process_pdf_bytes(
+    py: Python<'_>,
+    data: &[u8],
+    pages: Option<Vec<u32>>,
+) -> PyResult<PyPdfResult> {
+    let owned: Vec<u8> = data.to_vec();
     let mut opts = crate::PdfOptions::new();
     if let Some(p) = pages {
         opts = opts.pages(p);
     }
-    let result = crate::process_pdf_mem_with_options(data, opts).map_err(to_py_err)?;
+    let result = py
+        .allow_threads(move || crate::process_pdf_mem_with_options(&owned, opts))
+        .map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Fast detection only — no text extraction or markdown.
 #[pyfunction]
-fn detect_pdf(path: &str) -> PyResult<PyPdfResult> {
-    let result = crate::detect_pdf(path).map_err(to_py_err)?;
+fn detect_pdf(py: Python<'_>, path: &str) -> PyResult<PyPdfResult> {
+    let result = py
+        .allow_threads(|| crate::detect_pdf(path))
+        .map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
 /// Fast detection from bytes — no text extraction or markdown.
 #[pyfunction]
-fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
-    let result = crate::detect_pdf_mem(data).map_err(to_py_err)?;
+fn detect_pdf_bytes(py: Python<'_>, data: &[u8]) -> PyResult<PyPdfResult> {
+    let owned: Vec<u8> = data.to_vec();
+    let result = py
+        .allow_threads(move || crate::detect_pdf_mem(&owned))
+        .map_err(to_py_err)?;
     Ok(to_py_result(result))
 }
 
@@ -476,16 +490,27 @@ fn detect_pdf_bytes(data: &[u8]) -> PyResult<PyPdfResult> {
 /// Faster than detect_pdf as it skips building the full PdfProcessResult.
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
-fn classify_pdf(path: &str) -> PyResult<PyPdfClassification> {
+fn classify_pdf(py: Python<'_>, path: &str) -> PyResult<PyPdfClassification> {
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    classify_pdf_bytes(&data)
+    let result = py
+        .allow_threads(move || crate::classify_pdf_mem(&data))
+        .map_err(to_py_err)?;
+    Ok(PyPdfClassification {
+        pdf_type: pdf_type_str(result.pdf_type),
+        page_count: result.page_count,
+        pages_needing_ocr: result.pages_needing_ocr,
+        confidence: result.confidence,
+    })
 }
 
 /// Lightweight PDF classification from bytes.
 /// Pages in pages_needing_ocr are 0-indexed.
 #[pyfunction]
-fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
-    let result = crate::classify_pdf_mem(data).map_err(to_py_err)?;
+fn classify_pdf_bytes(py: Python<'_>, data: &[u8]) -> PyResult<PyPdfClassification> {
+    let owned: Vec<u8> = data.to_vec();
+    let result = py
+        .allow_threads(move || crate::classify_pdf_mem(&owned))
+        .map_err(to_py_err)?;
     Ok(PyPdfClassification {
         pdf_type: pdf_type_str(result.pdf_type),
         page_count: result.page_count,
@@ -496,27 +521,36 @@ fn classify_pdf_bytes(data: &[u8]) -> PyResult<PyPdfClassification> {
 
 /// Extract plain text from a PDF file.
 #[pyfunction]
-fn extract_text(path: &str) -> PyResult<String> {
-    crate::extract_text(path).map_err(to_py_err)
+fn extract_text(py: Python<'_>, path: &str) -> PyResult<String> {
+    py.allow_threads(|| crate::extract_text(path))
+        .map_err(to_py_err)
 }
 
 /// Extract plain text from PDF bytes.
 #[pyfunction]
-fn extract_text_bytes(data: &[u8]) -> PyResult<String> {
-    crate::extractor::extract_text_mem(data).map_err(to_py_err)
+fn extract_text_bytes(py: Python<'_>, data: &[u8]) -> PyResult<String> {
+    let owned: Vec<u8> = data.to_vec();
+    py.allow_threads(move || crate::extractor::extract_text_mem(&owned))
+        .map_err(to_py_err)
 }
 
 /// Extract text with position information from a file.
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
-fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<Vec<PyTextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extract_text_with_positions_pages(path, Some(&page_set)).map_err(to_py_err)?
-        }
-        None => crate::extract_text_with_positions(path).map_err(to_py_err)?,
-    };
+fn extract_text_with_positions(
+    py: Python<'_>,
+    path: &str,
+    pages: Option<Vec<u32>>,
+) -> PyResult<Vec<PyTextItem>> {
+    let items = py
+        .allow_threads(move || match pages {
+            Some(p) => {
+                let page_set: HashSet<u32> = p.into_iter().collect();
+                crate::extract_text_with_positions_pages(path, Some(&page_set))
+            }
+            None => crate::extract_text_with_positions(path),
+        })
+        .map_err(to_py_err)?;
     Ok(convert_text_items(items))
 }
 
@@ -524,17 +558,20 @@ fn extract_text_with_positions(path: &str, pages: Option<Vec<u32>>) -> PyResult<
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn extract_text_with_positions_bytes(
+    py: Python<'_>,
     data: &[u8],
     pages: Option<Vec<u32>>,
 ) -> PyResult<Vec<PyTextItem>> {
-    let items = match pages {
-        Some(p) => {
-            let page_set: HashSet<u32> = p.into_iter().collect();
-            crate::extractor::extract_text_with_positions_mem_pages(data, Some(&page_set))
-                .map_err(to_py_err)?
-        }
-        None => crate::extractor::extract_text_with_positions_mem(data).map_err(to_py_err)?,
-    };
+    let owned: Vec<u8> = data.to_vec();
+    let items = py
+        .allow_threads(move || match pages {
+            Some(p) => {
+                let page_set: HashSet<u32> = p.into_iter().collect();
+                crate::extractor::extract_text_with_positions_mem_pages(&owned, Some(&page_set))
+            }
+            None => crate::extractor::extract_text_with_positions_mem(&owned),
+        })
+        .map_err(to_py_err)?;
     Ok(convert_text_items(items))
 }
 
@@ -549,11 +586,16 @@ fn extract_text_with_positions_bytes(
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
 fn extract_text_in_regions(
+    py: Python<'_>,
     path: &str,
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let data = std::fs::read(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    extract_text_in_regions_bytes(&data, page_regions)
+    let regions = parse_page_regions(page_regions)?;
+    let results = py
+        .allow_threads(move || crate::extract_text_in_regions_mem(&data, &regions))
+        .map_err(to_py_err)?;
+    Ok(convert_region_results(results))
 }
 
 /// Extract text within bounding-box regions from PDF bytes.
@@ -567,11 +609,15 @@ fn extract_text_in_regions(
 ///     List of PageRegionTexts with per-region text and needs_ocr flag.
 #[pyfunction]
 fn extract_text_in_regions_bytes(
+    py: Python<'_>,
     data: &[u8],
     page_regions: Vec<(u32, Vec<Vec<f64>>)>,
 ) -> PyResult<Vec<PyPageRegionTexts>> {
     let regions = parse_page_regions(page_regions)?;
-    let results = crate::extract_text_in_regions_mem(data, &regions).map_err(to_py_err)?;
+    let owned: Vec<u8> = data.to_vec();
+    let results = py
+        .allow_threads(move || crate::extract_text_in_regions_mem(&owned, &regions))
+        .map_err(to_py_err)?;
     Ok(convert_region_results(results))
 }
 
@@ -593,10 +639,13 @@ fn extract_text_in_regions_bytes(
 #[pyfunction]
 #[pyo3(signature = (path, pages=None))]
 fn extract_pages_markdown(
+    py: Python<'_>,
     path: &str,
     pages: Option<Vec<u32>>,
 ) -> PyResult<PyPagesExtractionResult> {
-    let result = crate::extract_pages_markdown(path, pages.as_deref()).map_err(to_py_err)?;
+    let result = py
+        .allow_threads(move || crate::extract_pages_markdown(path, pages.as_deref()))
+        .map_err(to_py_err)?;
     Ok(to_py_pages_result(result))
 }
 
@@ -606,10 +655,14 @@ fn extract_pages_markdown(
 #[pyfunction]
 #[pyo3(signature = (data, pages=None))]
 fn extract_pages_markdown_bytes(
+    py: Python<'_>,
     data: &[u8],
     pages: Option<Vec<u32>>,
 ) -> PyResult<PyPagesExtractionResult> {
-    let result = crate::extract_pages_markdown_mem(data, pages.as_deref()).map_err(to_py_err)?;
+    let owned: Vec<u8> = data.to_vec();
+    let result = py
+        .allow_threads(move || crate::extract_pages_markdown_mem(&owned, pages.as_deref()))
+        .map_err(to_py_err)?;
     Ok(to_py_pages_result(result))
 }
 
