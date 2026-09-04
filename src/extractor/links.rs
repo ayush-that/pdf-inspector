@@ -114,14 +114,18 @@ pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> V
                             width,
                             height,
                             font: String::new(),
+                            font_tag: String::new(),
                             font_size: 0.0,
                             page: page_num,
                             is_bold: false,
                             is_italic: false,
                             is_underline: false,
                             is_strikeout: false,
+                            rotation: 0.0,
+                            advance_known: true,
                             item_type: ItemType::Link(url),
                             mcid: None,
+                            baseline_shift: 0.0,
                         });
                     }
                 }
@@ -447,14 +451,18 @@ pub(crate) fn walk_form_fields(
         width,
         height,
         font: String::new(),
+        font_tag: String::new(),
         font_size: 0.0,
         page: page_num,
         is_bold: false,
         is_italic: false,
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::FormField,
         mcid: None,
+        baseline_shift: 0.0,
     });
 }
 

@@ -5,6 +5,9 @@ use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
+    collect_text_in_region_in_frame, extract_text_with_positions_and_rotations_mem, PageRotation,
+};
+use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
@@ -15,8 +18,16 @@ use pdf_inspector::{
 use std::collections::HashSet;
 
 fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
+    make_text_pdf_with_boxes(content, media_box, None)
+}
+
+/// Like [`make_text_pdf`], optionally declaring a `/CropBox` on the page.
+fn make_text_pdf_with_boxes(content: &str, media_box: &str, crop_box: Option<&str>) -> Vec<u8> {
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = vec![0usize];
+    let crop_entry = crop_box
+        .map(|b| format!(" /CropBox [{b}]"))
+        .unwrap_or_default();
 
     fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
         offsets.push(pdf.len());
@@ -42,7 +53,7 @@ fn make_text_pdf(content: &str, media_box: &str) -> Vec<u8> {
         &mut offsets,
         3,
         &format!(
-            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            "<< /Type /Page /Parent 2 0 R /MediaBox [{media_box}]{crop_entry} /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
         ),
     );
 
@@ -282,14 +293,18 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         width: text.len() as f32 * font_size * 0.5,
         height: font_size,
         font: "Helvetica".to_string(),
+        font_tag: String::new(),
         font_size,
         page,
         is_bold: false,
         is_italic: false,
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
+        baseline_shift: 0.0,
     }
 }
 
@@ -309,14 +324,18 @@ fn make_text_item_with_font(
         width: text.len() as f32 * font_size * 0.5,
         height: font_size,
         font: font.to_string(),
+        font_tag: String::new(),
         font_size,
         page,
         is_bold: is_bold_font(font),
         is_italic: is_italic_font(font),
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
+        baseline_shift: 0.0,
     }
 }
 
@@ -1233,7 +1252,7 @@ fn test_not_a_pdf_extract_text_mem() {
 /// This catches regressions where code changes silently alter extraction
 /// or markdown output. If a change is intentional, update the snapshot:
 ///   cargo run --release --bin pdf2md -- tests/fixtures/<name>.pdf > tests/snapshots/<name>.md
-fn assert_snapshot(fixture: &str) {
+fn assert_snapshot(fixture: &str) -> String {
     let fixture_path = format!("tests/fixtures/{}.pdf", fixture);
     let snapshot_path = format!("tests/snapshots/{}.md", fixture);
 
@@ -1278,6 +1297,8 @@ fn assert_snapshot(fixture: &str) {
             snapshot_path,
         );
     }
+
+    actual.to_string()
 }
 
 #[test]
@@ -1308,6 +1329,175 @@ fn test_snapshot_real_estate_pricing() {
 #[test]
 fn test_snapshot_2013_app2() {
     assert_snapshot("2013-app2");
+}
+
+/// Base-Hebrew text stored in visual (screen left-to-right) order: each show
+/// op's characters are reversed relative to reading order and ops paint
+/// left-to-right across the line. Extraction must reverse each run back to
+/// logical order.
+#[test]
+fn test_snapshot_hebrew_visual_order() {
+    // The contains checks restate the intent independently of the snapshot
+    // file, so a bad snapshot refresh can't silently bless reversed output.
+    let output = assert_snapshot("hebrew_visual_order");
+    assert!(
+        output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
+        "visual-order Hebrew must extract in logical order, got: {output}"
+    );
+}
+
+/// Base-Hebrew text stored in logical (reading) order: each show op holds one
+/// word in reading order and successive ops are positioned right-to-left
+/// (the OCR-text-layer convention). Extraction must NOT reverse these runs —
+/// a codepoint-only trigger would corrupt them.
+#[test]
+fn test_snapshot_hebrew_logical_order() {
+    let output = assert_snapshot("hebrew_logical_order");
+    assert!(
+        output.contains("שלום עולם") && output.contains("דוח על הסיכונים"),
+        "logical-order Hebrew must stay in logical order, got: {output}"
+    );
+}
+
+/// Academic front matter: 11.96pt author names with 7.97pt affiliation
+/// markers raised 4.3pt (the commas inside a marker run come from a second
+/// font), affiliation lines whose markers LEAD their institution, a title
+/// whose asterisk is raised more than the 5pt rough-line window, and body
+/// text with a chemistry subscript and single footnote references.
+///
+/// Every marker must stay on its visual line, attached to its word: either
+/// fused as Unicode ("Huo¹", "H₂O", "¹Hong Kong") or wrapped as
+/// `<sup>…</sup>` when the run carries separators or symbols ("1,2,3",
+/// "2,*"). A fixed 3pt baseline window used to emit the raised markers as
+/// their own orphan line (",2,3,2,4,*") above the names.
+#[test]
+fn test_snapshot_author_block_superscripts() {
+    let output = assert_snapshot("author_block_superscripts");
+    assert!(
+        output.contains("Yibo Yan<sup>1,2,3</sup>, Jiahao Huo¹, Guanbo Feng¹,"),
+        "multi-glyph marker run must stay with its name: {output}"
+    );
+    assert!(
+        output.contains("Mingdong Ou<sup>2,4</sup>, Yi Cao<sup>2,*</sup>,")
+            && output.contains("Wei Zhang³, Ling Chen<sup>1,4</sup>"),
+        "symbol markers must stay with their name: {output}"
+    );
+    assert!(
+        output.contains("¹Hong Kong University of Science and Technology (Guangzhou), ²Alibaba Cloud Computing,"),
+        "leading markers must attach to the FOLLOWING word: {output}"
+    );
+    assert!(
+        output.contains(
+            "<sup>3,4</sup>Some Institute of Technology, <sup>*</sup>Corresponding author,"
+        ) && output.contains("⁴Institute for Advanced Study"),
+        "leading multi-glyph markers must attach to the following word: {output}"
+    );
+    assert!(
+        output.contains("Water is H₂O and the result² holds.")
+            && output.contains("See note¹² for details.")
+            && output.contains("Energy E = mc² as usual."),
+        "chemistry subscripts and single footnote references keep fusing: {output}"
+    );
+    assert!(
+        output.contains("A Fixture Title<sup>*</sup>"),
+        "a marker raised beyond the 5pt rough-line window still attaches: {output}"
+    );
+    assert!(
+        !output.lines().any(is_orphan_marker_line),
+        "no orphan marker line may remain: {output}"
+    );
+}
+
+/// A line made only of marker glyphs (digits, commas, asterisks, script
+/// tags) — what the old fixed-window grouping produced.
+fn is_orphan_marker_line(line: &str) -> bool {
+    let stripped = line
+        .replace("<sup>", "")
+        .replace("</sup>", "")
+        .replace("<sub>", "")
+        .replace("</sub>", "");
+    let stripped = stripped.trim();
+    !stripped.is_empty()
+        && stripped
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, ',' | '*' | ' ' | '¹' | '²' | '³' | '⁴'))
+}
+
+/// The region-text path (`extractTextInRegions`, what fire-pdf consumes)
+/// groups lines on its own: one output line per visual line, markers
+/// adjacent to their words, no orphan marker line.
+#[test]
+fn test_extract_regions_author_block_superscripts_one_line_per_visual_line() {
+    let buf = std::fs::read("tests/fixtures/author_block_superscripts.pdf").unwrap();
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let text = &regions[0].regions[0].text;
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "A Fixture Title<sup>*</sup>",
+            "Yibo Yan<sup>1,2,3</sup>, Jiahao Huo¹, Guanbo Feng¹,",
+            "Mingdong Ou<sup>2,4</sup>, Yi Cao<sup>2,*</sup>,",
+            "Wei Zhang³, Ling Chen<sup>1,4</sup>",
+            "¹Hong Kong University of Science and Technology (Guangzhou), ²Alibaba Cloud Computing,",
+            "<sup>3,4</sup>Some Institute of Technology, <sup>*</sup>Corresponding author,",
+            "⁴Institute for Advanced Study",
+            "Water is H₂O and the result² holds.",
+            "See note¹² for details.",
+            "Energy E = mc² as usual.",
+        ],
+        "region text: {text}"
+    );
+    assert!(!regions[0].regions[0].needs_ocr);
+}
+
+/// Positioned items expose the marker geometry: unfused runs carry a
+/// positive `baseline_shift` and snap to the body baseline via `line_y`.
+#[test]
+fn test_positions_author_block_superscripts_expose_baseline_shift() {
+    let buf = std::fs::read("tests/fixtures/author_block_superscripts.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+
+    let flagged: Vec<&TextItem> = items.iter().filter(|it| it.is_script()).collect();
+    let flagged_texts: Vec<&str> = flagged.iter().map(|it| it.text.as_str()).collect();
+    for expected in ["1,2,3", "2,4", "2,*", "1,4", "3,4", "*"] {
+        assert!(
+            flagged_texts.contains(&expected),
+            "expected {expected:?} among flagged runs {flagged_texts:?}"
+        );
+    }
+    for item in &flagged {
+        assert!(item.baseline_shift > 0.0, "raised marker: {item:?}");
+    }
+    let marker = flagged.iter().find(|it| it.text == "1,2,3").unwrap();
+    let name = items.iter().find(|it| it.text == "Yibo Yan").unwrap();
+    assert!(
+        (marker.line_y() - name.y).abs() < 0.01,
+        "marker snaps to its name's baseline"
+    );
+    assert!(
+        (marker.baseline_shift - 4.3).abs() < 0.05,
+        "shift is the raw raise: {}",
+        marker.baseline_shift
+    );
+
+    // Fused runs carry no shift and no separate item (the name arrives
+    // already merged with the body comma before it).
+    assert!(items
+        .iter()
+        .any(|it| it.text.ends_with("Jiahao Huo¹") && !it.is_script()));
+    assert!(items
+        .iter()
+        .any(|it| it.text.starts_with("¹Hong Kong University") && !it.is_script()));
+    assert!(items.iter().any(|it| it.text == "See note¹²"));
+    assert!(items.iter().any(|it| it.text == "Water is H₂"));
+    assert!(!items
+        .iter()
+        .any(|it| it.text == "12" || it.text == "1" || it.text == "2"));
 }
 
 /// First two pages of Shannon's "A Mathematical Theory of Communication"
@@ -1427,6 +1617,77 @@ fn test_firecrawl_tagged_pdf_struct_tree() {
     );
     // Fences come in open/close pairs
     assert_eq!(fence_count % 2, 0, "Code fences should be balanced");
+}
+
+#[test]
+fn test_tagged_pdf_text_items_carry_mcid() {
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    assert!(
+        items.iter().any(|i| i.mcid.is_some()),
+        "Tagged PDF text items should carry Marked Content IDs"
+    );
+}
+
+#[test]
+fn test_extract_structure_elements_tagged_pdf() {
+    let buf = std::fs::read("tests/fixtures/firecrawl_docs_tagged.pdf").unwrap();
+    let elements = pdf_inspector::extract_structure_elements_mem(&buf, None).unwrap();
+    assert!(!elements.is_empty(), "Tagged PDF should yield elements");
+    assert!(
+        elements.iter().any(|e| e.role == "H1"),
+        "Should surface H1 heading roles"
+    );
+    assert!(
+        elements.iter().all(|e| !e.role.is_empty()),
+        "Every element should carry a role name"
+    );
+
+    // Sorted by (page, mcid) for deterministic output
+    assert!(
+        elements
+            .windows(2)
+            .all(|w| (w[0].page, w[0].mcid) <= (w[1].page, w[1].mcid)),
+        "Elements should be sorted by (page, mcid)"
+    );
+
+    // The advertised join: (page, mcid) pairs must line up with the
+    // mcid-carrying TextItems from positioned extraction, and joining the
+    // H1 entries must recover non-empty heading text.
+    let items = pdf_inspector::extractor::extract_text_with_positions_mem(&buf).unwrap();
+    let h1_refs: std::collections::HashSet<(u32, i64)> = elements
+        .iter()
+        .filter(|e| e.role == "H1")
+        .map(|e| (e.page, e.mcid))
+        .collect();
+    let h1_text: String = items
+        .iter()
+        .filter(|i| i.mcid.is_some_and(|mcid| h1_refs.contains(&(i.page, mcid))))
+        .map(|i| i.text.as_str())
+        .collect();
+    assert!(
+        !h1_text.trim().is_empty(),
+        "Joining H1 structure elements to text items should recover heading text"
+    );
+
+    // Page filter is 1-indexed (matching TextItem.page) and equals the
+    // corresponding subset of the full document result.
+    let page1 = pdf_inspector::extract_structure_elements_mem(&buf, Some(&[1])).unwrap();
+    assert!(!page1.is_empty(), "Page 1 should have elements");
+    assert!(page1.iter().all(|e| e.page == 1));
+    let full_page1_count = elements.iter().filter(|e| e.page == 1).count();
+    assert_eq!(page1.len(), full_page1_count);
+}
+
+#[test]
+fn test_extract_structure_elements_untagged_pdf_empty() {
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let elements = pdf_inspector::extract_structure_elements_mem(&buf, None).unwrap();
+    assert!(
+        elements.is_empty(),
+        "Untagged PDF should yield no structure elements, got {:?}",
+        elements
+    );
 }
 
 #[test]
@@ -1581,6 +1842,282 @@ fn test_extract_regions_mem_basic_text_pdf() {
     let first = &regions[0].regions[0];
     assert!(!first.text.trim().is_empty(), "First page should have text");
     assert_eq!(regions[0].page, 0);
+}
+
+/// Build a synthetic "scanned page" PDF: a full-page image XObject with a
+/// text layer drawn in the given render mode (3 = invisible OCR overlay,
+/// 0 = normal visible fill). `visible_extra` optionally adds a normally
+/// rendered line so double-layer behavior can be tested; `layer_lines`
+/// overrides the layer content (default: three pangram lines);
+/// `quote_ops` shows every layer line via the `'` operator instead of Tj
+/// (both are standard show-text encodings for OCR layers).
+fn make_pdf_with_custom_text_layer(
+    text_render_mode: i32,
+    visible_extra: Option<&str>,
+    layer_lines: Option<&[&str]>,
+    quote_ops: bool,
+) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    fn add_stream_object(
+        pdf: &mut Vec<u8>,
+        offsets: &mut Vec<usize>,
+        id: usize,
+        dict: &str,
+        stream_bytes: &[u8],
+    ) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("<< {} /Length {} >>\nstream\n", dict, stream_bytes.len()).as_bytes(),
+        );
+        pdf.extend_from_slice(stream_bytes);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+         /Contents 4 0 R >>",
+    );
+    // Full-page raster, then the text layer in the requested render mode —
+    // several lines so the OCR-layer gate's alnum floor (40) is well cleared.
+    let mut content = String::from("q 612 0 0 792 0 0 cm /Im0 Do Q\n");
+    let default_layer = [
+        "The quick brown fox jumps over the lazy dog",
+        "Pack my box with five dozen liquor jugs tonight",
+        "Sphinx of black quartz judge my vow carefully",
+    ];
+    let layer: &[&str] = layer_lines.unwrap_or(&default_layer);
+    if quote_ops {
+        // Every line shown via `'` (move-to-next-line + show) — nothing on
+        // this layer goes through Tj, pinning the `'` suppression path.
+        content.push_str(&format!(
+            "BT /F1 12 Tf {text_render_mode} Tr 16 TL 72 716 Td "
+        ));
+        for line in layer {
+            content.push_str(&format!("({line}) ' "));
+        }
+    } else {
+        content.push_str(&format!("BT /F1 12 Tf {text_render_mode} Tr 72 700 Td "));
+        for (i, line) in layer.iter().enumerate() {
+            if i > 0 {
+                content.push_str("0 -16 Td ");
+            }
+            content.push_str(&format!("({line}) Tj "));
+        }
+    }
+    content.push_str("ET\n");
+    if let Some(extra) = visible_extra {
+        content.push_str(&format!("BT /F1 12 Tf 0 Tr 72 500 Td ({extra}) Tj ET\n"));
+    }
+    add_stream_object(&mut pdf, &mut offsets, 4, "", content.as_bytes());
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    let image_pixel = [128u8];
+    add_stream_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+         /ColorSpace /DeviceGray /BitsPerComponent 8",
+        &image_pixel,
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+fn make_pdf_with_text_layer(text_render_mode: i32, visible_extra: Option<&str>) -> Vec<u8> {
+    make_pdf_with_custom_text_layer(text_render_mode, visible_extra, None, false)
+}
+
+/// A scanned page whose only text is an invisible (Tr 3) OCR layer behind
+/// the raster must serve that layer from the region extractor instead of
+/// reporting the region as needs_ocr — the exact text is already in the PDF.
+#[test]
+fn test_extract_regions_mem_recovers_invisible_ocr_layer() {
+    let buf = make_pdf_with_text_layer(3, None);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    assert_eq!(regions.len(), 1);
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.contains("quick brown fox"),
+        "invisible OCR layer should be served as region text, got: {:?}",
+        region.text
+    );
+    assert!(
+        !region.needs_ocr,
+        "recovered OCR layer must not fall back to GPU OCR"
+    );
+}
+
+/// ANY visible text on the page — even a single short line — must block the
+/// invisible-layer adoption entirely: the invisible pass returns visible
+/// items too, so adopting it alongside visible text would duplicate the
+/// visible words. Strict zero-visible gate, no fuzzy dedupe.
+#[test]
+fn test_extract_regions_mem_visible_text_blocks_invisible_layer() {
+    let buf = make_pdf_with_text_layer(3, Some("Folio 142"));
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.contains("Folio 142"),
+        "visible text should be extracted, got: {:?}",
+        region.text
+    );
+    assert!(
+        !region.text.contains("quick brown fox"),
+        "invisible layer must not be adopted when any visible text exists, got: {:?}",
+        region.text
+    );
+    assert_eq!(
+        region.text.matches("Folio 142").count(),
+        1,
+        "visible text must appear exactly once, got: {:?}",
+        region.text
+    );
+}
+
+/// An invisible OCR layer shown entirely via the `'` show-text operator
+/// (move-to-next-line + show) must also be recovered — the skipped_invisible
+/// signal has to fire on every show-text path, not just Tj/TJ.
+#[test]
+fn test_extract_regions_mem_recovers_quote_operator_layer() {
+    let buf = make_pdf_with_custom_text_layer(3, None, None, true);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        region.text.contains("quick brown fox"),
+        "'-operator OCR layer should be recovered, got: {:?}",
+        region.text
+    );
+    assert!(!region.needs_ocr);
+}
+
+/// An invisible layer below the 40-alnum floor (a stray watermark line)
+/// must NOT be adopted — the region keeps its needs_ocr fallback.
+#[test]
+fn test_extract_regions_mem_tiny_invisible_layer_not_adopted() {
+    let buf = make_pdf_with_custom_text_layer(3, None, Some(&["Scanned by ACME"]), false);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.contains("Scanned by ACME"),
+        "below-floor invisible layer must not be adopted, got: {:?}",
+        region.text
+    );
+    // Only the raster placeholder remains — needs_ocr stays whatever main
+    // reports for placeholder-only regions (false today; downstream
+    // pipelines route placeholder-only text to OCR themselves, and this PR
+    // deliberately does not change that contract).
+    assert!(
+        region.text.trim().starts_with("[Image:"),
+        "region should hold only the raster placeholder, got: {:?}",
+        region.text
+    );
+}
+
+/// An invisible layer that clears the alnum floor but is mostly symbol
+/// garbage (a broken OCR run) must be rejected by the garbage gate.
+#[test]
+fn test_extract_regions_mem_garbage_invisible_layer_not_adopted() {
+    // Each line: 5 alphanumerics among 15 symbol chars. Ten lines clear the
+    // 40-alnum floor (50 alnum) while staying well under the half-alnum
+    // ratio is_garbage_text requires.
+    let garbage_lines: Vec<&str> = vec!["a@@b%%c&&d==e~~"; 10];
+    let buf = make_pdf_with_custom_text_layer(3, None, Some(&garbage_lines), false);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.contains("a@@b"),
+        "garbage invisible layer must not be adopted, got: {:?}",
+        region.text
+    );
+    assert!(
+        region.text.trim().starts_with("[Image:"),
+        "region should hold only the raster placeholder, got: {:?}",
+        region.text
+    );
+}
+
+/// Punctuation-only visible text (zero alphanumerics) must ALSO block
+/// adoption — the gate is item-presence, not alphanumeric mass. (Real-world
+/// rationale: an invisible OCR layer transcribes the raster, so visible
+/// glyphs typically have invisible twins there; this fixture's layers are
+/// disjoint, so it pins the gate itself, not the duplication scenario.)
+#[test]
+fn test_extract_regions_mem_punctuation_visible_blocks_invisible_layer() {
+    let buf = make_pdf_with_text_layer(3, Some("... --- ..."));
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert!(
+        !region.text.contains("quick brown fox"),
+        "invisible layer must not be adopted over punctuation-only visible text, got: {:?}",
+        region.text
+    );
+    assert_eq!(
+        region.text.matches("... --- ...").count(),
+        1,
+        "visible punctuation must be preserved exactly once, got: {:?}",
+        region.text
+    );
+}
+
+/// Regression guard: a normal visible-text page (render mode 0) is served
+/// once and only once — if the fallback ever mis-fired here and merged a
+/// second pass, the phrase would duplicate.
+#[test]
+fn test_extract_regions_mem_visible_layer_unchanged() {
+    let buf = make_pdf_with_text_layer(0, None);
+    let regions = extract_text_in_regions_mem(&buf, &full_page_regions(1)).unwrap();
+    let region = &regions[0].regions[0];
+    assert_eq!(
+        region.text.matches("quick brown fox").count(),
+        1,
+        "visible text must appear exactly once, got: {:?}",
+        region.text
+    );
+    assert!(!region.needs_ocr);
 }
 
 #[test]
@@ -2031,6 +2568,14 @@ fn synthetic_dense_table_pdf() -> Vec<u8> {
 }
 
 fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
+    synthetic_vector_grid_pdf_with_crop_box(two_tables, None)
+}
+
+/// [`synthetic_vector_grid_pdf`] with an optional `/CropBox` on the page.
+fn synthetic_vector_grid_pdf_with_crop_box(
+    two_tables: bool,
+    crop_box: Option<[i64; 4]>,
+) -> Vec<u8> {
     use lopdf::content::{Content, Operation};
     use lopdf::{dictionary, Document, Object, Stream};
 
@@ -2102,21 +2647,24 @@ fn synthetic_vector_grid_pdf(two_tables: bool) -> Vec<u8> {
     doc.objects
         .insert(content_id, Stream::new(dictionary! {}, content).into());
 
-    doc.objects.insert(
-        page_id,
-        dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
-            "Resources" => dictionary! {
-                "Font" => dictionary! {
-                    "F1" => font_id,
-                },
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 800.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
             },
-            "Contents" => content_id,
-        }
-        .into(),
-    );
+        },
+        "Contents" => content_id,
+    };
+    if let Some(crop_box) = crop_box {
+        page.set(
+            "CropBox",
+            Object::Array(crop_box.iter().map(|&v| v.into()).collect()),
+        );
+    }
+    doc.objects.insert(page_id, page.into());
     doc.objects.insert(
         pages_id,
         dictionary! {
@@ -3149,6 +3697,23 @@ fn test_extract_pages_markdown_basic() {
 }
 
 #[test]
+fn test_extract_pages_markdown_keeps_line_based_tables() {
+    // The per-page path (used by every `--ocr auto` run) once passed an
+    // empty line slice to markdown conversion, silently dropping every
+    // table that only the line-based detector finds. Keep this synthetic
+    // table to four text items so the heuristic detector cannot qualify it
+    // (it requires at least six); the vector rules are the only structural
+    // evidence available to the pages API.
+    let buf = synthetic_vector_grid_pdf(false);
+    let result = extract_pages_markdown_mem(&buf, None).unwrap();
+
+    assert!(
+        result.pages[0].markdown.contains("|A1|B1|"),
+        "line-based table rows missing from pages API output"
+    );
+}
+
+#[test]
 fn test_extract_pages_markdown_uses_document_wide_folio_context() {
     let pdf = make_recurring_contextual_folio_pdf();
     let result = extract_pages_markdown_mem(&pdf, None).unwrap();
@@ -4051,4 +4616,416 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
          trustworthy, got: {:?}",
         page.markdown
     );
+}
+
+// =========================================================================
+// Rotated text-run geometry (fixture: rotated_margin_stamp.pdf)
+// =========================================================================
+
+/// An upright Letter page with a title, a two-column body, and a 20pt
+/// arXiv-style identifier shown with a 90° counter-clockwise text matrix
+/// (`0 1 -1 0 32 200 Tm`) along the left margin, reading bottom to top.
+const ROTATED_STAMP_FIXTURE: &str = "tests/fixtures/rotated_margin_stamp.pdf";
+const ROTATED_STAMP_TEXT: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+#[test]
+fn test_rotated_margin_run_has_tall_thin_box_and_rotation() {
+    let items = extract_text_with_positions(ROTATED_STAMP_FIXTURE).unwrap();
+    let stamp = items
+        .iter()
+        .find(|i| i.text == ROTATED_STAMP_TEXT)
+        .expect("stamp item");
+    assert!(
+        (stamp.rotation - 90.0).abs() < 1e-3,
+        "rotation = {}",
+        stamp.rotation
+    );
+    assert!(!stamp.is_horizontal());
+    // The glyphs extend one em to the left of the baseline drawn at x = 32,
+    // and the run starts at y = 200 then advances up the page.
+    assert!((stamp.x - 12.0).abs() < 0.05, "x = {}", stamp.x);
+    assert!((stamp.width - 20.0).abs() < 0.05, "width = {}", stamp.width);
+    assert!((stamp.y - 200.0).abs() < 0.05, "y = {}", stamp.y);
+    assert!(
+        stamp.height > 300.0 && stamp.height < 500.0,
+        "height = {}",
+        stamp.height
+    );
+    assert!(
+        stamp.height > 10.0 * stamp.width,
+        "box must be tall and thin, got {}x{}",
+        stamp.width,
+        stamp.height
+    );
+    assert_eq!(stamp.font_size, 20.0);
+
+    // Upright body text keeps the historical box: baseline y, em height,
+    // advance width, no rotation.
+    let body = items
+        .iter()
+        .find(|i| i.text.starts_with("The quick brown fox"))
+        .expect("body item");
+    assert_eq!(body.rotation, 0.0);
+    assert!(body.is_horizontal());
+    assert_eq!((body.x, body.y, body.height), (72.0, 690.0, 11.0));
+    assert!(
+        body.width > 150.0 && body.width < 250.0,
+        "width = {}",
+        body.width
+    );
+
+    assert!(
+        items
+            .iter()
+            .filter(|i| !i.text.trim().is_empty())
+            .all(|i| i.width > 0.0),
+        "no run with glyphs may be zero-width"
+    );
+}
+
+#[test]
+fn test_rotated_margin_run_is_assigned_to_margin_region_only() {
+    let buf = std::fs::read(ROTATED_STAMP_FIXTURE).unwrap();
+    // Top-left page coordinates, as layout models report them: a left-margin
+    // strip next to the body area. Before the geometry fix the stamp's
+    // zero width was replaced by a chars × 0.5em phantom that crossed into
+    // the body box, so the body region won the exclusive assignment and the
+    // margin region came back empty.
+    let margin = [0.0, 0.0, 50.0, 792.0];
+    let body = [60.0, 0.0, 612.0, 792.0];
+    let results = extract_text_in_regions_mem(&buf, &[(0, vec![margin, body])]).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].regions.len(), 2);
+    let (margin_text, body_text) = (&results[0].regions[0], &results[0].regions[1]);
+    assert_eq!(margin_text.text.trim(), ROTATED_STAMP_TEXT);
+    assert!(!margin_text.needs_ocr);
+    assert!(
+        !body_text.text.contains("arXiv"),
+        "stamp leaked into the body region: {:?}",
+        body_text.text
+    );
+    assert!(body_text.text.contains("The quick brown fox"));
+    assert!(body_text.text.contains("title line across both columns."));
+
+    // The margin box alone recovers the same stamp: pairing it with the body
+    // box must not change the answer.
+    let solo = extract_text_in_regions_mem(&buf, &[(0, vec![margin])]).unwrap();
+    assert_eq!(solo[0].regions[0].text.trim(), ROTATED_STAMP_TEXT);
+}
+
+#[test]
+fn test_clockwise_rotated_page_reads_in_order_and_regions_follow() {
+    // Top-to-bottom runs (`Tm = [0 -1 1 0]`): a page rotated clockwise. The
+    // first line runs down the page at x = 300, the next line sits to its
+    // LEFT at x = 270. The frame must be turned clockwise (not the fixed
+    // counter-clockwise turn, which mirrors both word and line order), and
+    // region boxes given in page coordinates must follow that frame.
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let find = |t: &str| {
+        items
+            .iter()
+            .find(|i| i.text.contains(t))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {t} in {:?}",
+                    items.iter().map(|i| &i.text).collect::<Vec<_>>()
+                )
+            })
+    };
+    let (hello, second) = (find("HELLO"), find("SECOND"));
+    assert!(
+        items.iter().all(|i| i.rotation == 0.0 && i.is_horizontal()),
+        "{items:?}"
+    );
+    assert!(hello.y > second.y, "first line must stack above the second");
+    assert!(
+        (hello.x - second.x).abs() < 0.5,
+        "both lines start at the same left edge"
+    );
+
+    let full = extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    let text = &full[0].regions[0].text;
+    let at = |t: &str| text.find(t).unwrap_or_else(|| panic!("no {t} in {text:?}"));
+    assert!(at("HELLO") < at("WORLD") && at("WORLD") < at("SECOND") && at("SECOND") < at("LINE"));
+
+    // A top-left page box around the first line only (page x 290..320,
+    // y 87..192 from the top) must select exactly that line.
+    let first_line =
+        extract_text_in_regions_mem(&buf, &[(0, vec![[290.0, 87.0, 320.0, 192.0]])]).unwrap();
+    let text = &first_line[0].regions[0].text;
+    assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+    assert!(
+        !text.contains("SECOND") && !text.contains("LINE"),
+        "{text:?}"
+    );
+
+    // Callers holding the items can ask for each page's frame and pass it
+    // explicitly to the region helper instead of relying on inference.
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+    let text =
+        collect_text_in_region_in_frame(&items, 290.0, 87.0, 320.0, 192.0, 792.0, PageRotation::Cw);
+    assert!(
+        text.contains("HELLO") && !text.contains("SECOND"),
+        "{text:?}"
+    );
+
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        md.find("HELLO").unwrap() < md.find("WORLD").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("WORLD").unwrap() < md.find("SECOND").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("SECOND").unwrap() < md.find("LINE").unwrap(),
+        "{md}"
+    );
+}
+
+// =========================================================================
+// Coordinate frame: positions and regions share the visible page box
+// =========================================================================
+
+fn find_item<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+    items
+        .iter()
+        .find(|item| item.text.trim() == text)
+        .unwrap_or_else(|| panic!("no item with text {text:?} in {items:#?}"))
+}
+
+/// Top-left region (visible-box frame) covering exactly `item`, given the
+/// visible box height — how a consumer turns a positioned item back into the
+/// box a renderer draws around it.
+fn item_region(item: &TextItem, visible_height: f32) -> [f32; 4] {
+    [
+        item.x,
+        visible_height - item.y - item.height,
+        item.x + item.width,
+        visible_height - item.y,
+    ]
+}
+
+fn region_text(buf: &[u8], region: [f32; 4]) -> String {
+    extract_text_in_regions_mem(buf, &[(0, vec![region])])
+        .unwrap()
+        .remove(0)
+        .regions
+        .remove(0)
+        .text
+}
+
+#[test]
+fn test_positions_are_relative_to_cropbox_origin() {
+    // MediaBox [0 0 400 500], CropBox [50 60 350 460]; the glyph is written
+    // at raw (120, 300), so a CropBox render puts it at (70, 240) from the
+    // visible box's lower-left corner.
+    let path = "tests/fixtures/cropbox_offset_origin.pdf";
+    let buf = std::fs::read(path).unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let glyph = find_item(&items, "Visible glyph");
+    assert_close(glyph.x, 70.0);
+    assert_close(glyph.y, 240.0);
+
+    // Every public variant shares the frame.
+    let from_path = extract_text_with_positions(path).unwrap();
+    let path_glyph = find_item(&from_path, "Visible glyph");
+    assert_eq!((path_glyph.x, path_glyph.y), (glyph.x, glyph.y));
+    let page_filter: HashSet<u32> = [1].into_iter().collect();
+    let paged =
+        pdf_inspector::extractor::extract_text_with_positions_mem_pages(&buf, Some(&page_filter))
+            .unwrap();
+    let paged_glyph = find_item(&paged, "Visible glyph");
+    assert_eq!((paged_glyph.x, paged_glyph.y), (glyph.x, glyph.y));
+
+    // The region API reads the same frame: the glyph's own box in the
+    // visible box's top-left space (300 x 400) yields exactly that line.
+    let text = region_text(&buf, item_region(glyph, 400.0));
+    assert!(text.contains("Visible glyph"), "got {text:?}");
+    assert!(!text.contains("Second line"), "got {text:?}");
+
+    // The same box in raw MediaBox coordinates (the previous frame) lands on
+    // a different line — the silent mis-selection the shared frame fixes.
+    let raw_region = [
+        120.0,
+        500.0 - 300.0 - glyph.height,
+        120.0 + glyph.width,
+        500.0 - 300.0,
+    ];
+    let raw_text = region_text(&buf, raw_region);
+    assert!(!raw_text.contains("Visible glyph"), "got {raw_text:?}");
+    assert!(raw_text.contains("Third line"), "got {raw_text:?}");
+}
+
+#[test]
+fn test_positions_use_cropbox_intersected_with_offset_mediabox() {
+    // The MediaBox origin is itself non-zero and the CropBox pokes below it:
+    // renderers show the intersection (36, 36)-(648, 783), 612 x 747.
+    let content = "BT /F1 12 Tf 100 100 Td (Anchor) Tj ET";
+    let buf = make_text_pdf_with_boxes(content, "36 36 648 819", Some("36 0 648 783"));
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 64.0);
+    assert_close(anchor.y, 64.0);
+    let text = region_text(&buf, item_region(anchor, 747.0));
+    assert!(text.contains("Anchor"), "got {text:?}");
+
+    // Without a CropBox, the MediaBox origin alone shifts the frame.
+    let buf = make_text_pdf_with_boxes(content, "36 36 648 819", None);
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 64.0);
+    assert_close(anchor.y, 64.0);
+    let text = region_text(&buf, item_region(anchor, 783.0));
+    assert!(text.contains("Anchor"), "got {text:?}");
+}
+
+#[test]
+fn test_positions_unchanged_when_cropbox_matches_mediabox() {
+    // Origin MediaBox, no CropBox: raw coordinates pass through untouched.
+    let content = "BT /F1 12 Tf 72 700 Td (Anchor) Tj ET";
+    let items = extract_text_with_positions_mem(&make_text_pdf(content, "0 0 612 792")).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 72.0);
+    assert_close(anchor.y, 700.0);
+
+    // An explicit CropBox equal to the MediaBox changes nothing either.
+    let buf = make_text_pdf_with_boxes(content, "0 0 612 792", Some("0 0 612 792"));
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let anchor = find_item(&items, "Anchor");
+    assert_close(anchor.x, 72.0);
+    assert_close(anchor.y, 700.0);
+
+    // Real fixture without a CropBox: pinned to the previous output.
+    let buf = std::fs::read("tests/fixtures/thermo-freon12.pdf").unwrap();
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let title = items
+        .iter()
+        .find(|item| item.page == 1 && item.text == "Technical Information")
+        .expect("title item");
+    assert_close(title.x, 314.25);
+    assert_close(title.y, 645.0);
+}
+
+#[test]
+fn test_region_table_apis_use_visible_box_frame() {
+    use pdf_inspector::{
+        extract_tables_with_structure_cells_mem, extract_tables_with_structure_mem, TsrTableInput,
+    };
+
+    // The 2x2 ruled grid of `synthetic_vector_grid_pdf`, on a page whose
+    // CropBox [20 100 280 780] shifts the visible frame by (20, 20) from the
+    // MediaBox's top-left corner and makes it 260 x 680.
+    let buf = synthetic_vector_grid_pdf_with_crop_box(false, Some([20, 100, 280, 780]));
+    // The raw MediaBox-frame crop [50, 60, 210, 130] expressed in that frame.
+    let crop = [30.0_f32, 40.0, 190.0, 110.0];
+    let detected = detect_vector_grid_in_region_mem(&buf, 0, crop, 72.0)
+        .unwrap()
+        .expect("ruled vector table should be detected in the visible-box frame");
+    assert_eq!(detected.cell_bboxes.len(), 4);
+    // Cell bboxes are crop-relative pixels, so they match the CropBox-free page.
+    let first = &detected.cell_bboxes[0];
+    assert_close(first[0], 0.0);
+    assert_close(first[1], 0.0);
+    assert_close(first[2], 80.0);
+    assert_close(first[3], 30.0);
+
+    let input = TsrTableInput {
+        page: 0,
+        crop_pdf_pt_bbox: crop,
+        render_dpi: 72.0,
+        structure_tokens: detected.structure_tokens.clone(),
+        cell_bboxes: detected.cell_bboxes.clone(),
+    };
+    let markdown = extract_tables_with_structure_mem(&buf, std::slice::from_ref(&input))
+        .unwrap()
+        .remove(0);
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(markdown.contains(tok), "expected {tok} in {markdown}");
+    }
+    // The cell fill reads the same frame the crop was given in.
+    let cells = extract_tables_with_structure_cells_mem(&buf, std::slice::from_ref(&input))
+        .unwrap()
+        .remove(0);
+    let cell_text = |row: usize, col: usize| {
+        cells
+            .iter()
+            .find(|c| c.row == row && c.col == col)
+            .map(|c| c.text.trim().to_string())
+            .unwrap_or_default()
+    };
+    assert_eq!(cell_text(0, 0), "A1");
+    assert_eq!(cell_text(1, 1), "B2");
+
+    // The heuristic region path agrees.
+    let results =
+        extract_tables_in_regions_mem(&buf, &[(0, vec![[20.0, 30.0, 200.0, 740.0]])]).unwrap();
+    let region = &results[0].regions[0];
+    assert!(!region.needs_ocr, "expected a table, got needs_ocr");
+    for tok in ["A1", "B1", "A2", "B2"] {
+        assert!(
+            region.text.contains(tok),
+            "expected {tok} in {}",
+            region.text
+        );
+    }
+}
+
+#[test]
+fn test_turned_page_positions_are_independent_of_the_box_origin() {
+    // The clockwise page of `test_clockwise_rotated_page_reads_in_order_and_regions_follow`
+    // drawn on a MediaBox whose origin is (50, 60), content shifted by the
+    // same amount: every item must report exactly the positions of its
+    // origin-0 twin — the visible-box shift is turned with the frame — and
+    // the region API must read that frame.
+    let plain_content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let shifted_content = "BT /F1 12 Tf 0 -1 1 0 350 760 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 350 715 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 320 760 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 320 704 Tm (LINE) Tj ET";
+    let plain = make_text_pdf(plain_content, "0 0 612 792");
+    let shifted = make_text_pdf(shifted_content, "50 60 662 852");
+    let (plain_items, plain_frames) =
+        extract_text_with_positions_and_rotations_mem(&plain).unwrap();
+    let (shifted_items, shifted_frames) =
+        extract_text_with_positions_and_rotations_mem(&shifted).unwrap();
+    assert_eq!(plain_frames.get(&1), Some(&PageRotation::Cw));
+    assert_eq!(shifted_frames.get(&1), Some(&PageRotation::Cw));
+    let find = |items: &[TextItem], text: &str| -> TextItem {
+        items
+            .iter()
+            .find(|i| i.text.contains(text))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {text} in {items:?}"))
+    };
+    for text in ["HELLO", "WORLD", "SECOND", "LINE"] {
+        let (a, b) = (find(&plain_items, text), find(&shifted_items, text));
+        assert_close(a.x, b.x);
+        assert_close(a.y, b.y);
+        assert_close(a.width, b.width);
+        assert_close(a.height, b.height);
+        assert_eq!(a.rotation, b.rotation);
+    }
+
+    // The top-left region around the first line selects exactly that line
+    // in both documents.
+    for buf in [&plain, &shifted] {
+        let text = region_text(buf, [290.0, 87.0, 320.0, 192.0]);
+        assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+        assert!(
+            !text.contains("SECOND") && !text.contains("LINE"),
+            "{text:?}"
+        );
+    }
 }

@@ -225,6 +225,66 @@ pub(crate) fn build_type3_scales(
     scales
 }
 
+/// Resource names of Type3 fonts whose `FontMatrix` mirrors the y axis
+/// (`d < 0`). dvips/PK bitmap fonts declare `[1 0 0 -1 0 0]` and pair it with
+/// a y-flipped text matrix so the glyphs render upright; the run geometry
+/// must undo the flip when deciding which side of the baseline the glyph box
+/// lies on (see `geometry::run_geometry`).
+pub(crate) fn build_type3_y_flips(
+    doc: &Document,
+    fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
+) -> std::collections::HashSet<String> {
+    let mut flipped = std::collections::HashSet::new();
+    for (font_name, font_dict) in fonts {
+        let is_type3 = font_dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .is_some_and(|n| n == b"Type3");
+        if !is_type3 {
+            continue;
+        }
+        let Some(matrix) = font_dict
+            .get(b"FontMatrix")
+            .ok()
+            .and_then(|o| resolve_array(doc, o))
+        else {
+            continue;
+        };
+        let Some(d) = matrix.get(3) else {
+            continue;
+        };
+        let d = match d {
+            Object::Reference(r) => doc.get_object(*r).ok().and_then(|o| o.as_float().ok()),
+            other => other.as_float().ok(),
+        };
+        if d.is_some_and(|d| d < 0.0) {
+            flipped.insert(String::from_utf8_lossy(font_name).to_string());
+        }
+    }
+    flipped
+}
+
+/// The name a `TextItem` carries for its font: the `/BaseFont` family name
+/// ("ABCDEF+CMMI10"), which identifies the actual face, rather than the
+/// arbitrary per-page resource tag ("F2").
+///
+/// Exception: resource names using Distiller's CID convention (`C2_0`,
+/// `C0_1`) are kept as-is — `text_utils::is_cid_font` keys on that prefix
+/// for micro-gap joining, and the family name carries no CID marker to
+/// replace it. This is a known, deliberate wart: `TextItem::font` is the
+/// face name except for this one producer convention. The clean fix is an
+/// explicit CID flag on `TextItem`, which touches its ~29 construction
+/// sites; do that migration when `TextItem` next changes shape, and delete
+/// this carve-out with it.
+pub(crate) fn item_font_name<'a>(resource_name: &'a str, base_font: &'a str) -> &'a str {
+    if crate::text_utils::is_cid_font(resource_name) {
+        resource_name
+    } else {
+        base_font
+    }
+}
+
 /// Parse font widths from a font dictionary, dispatching by Subtype
 pub(crate) fn parse_font_widths(
     doc: &Document,
@@ -482,7 +542,11 @@ pub(crate) fn parse_cid_w_array(
     widths: &mut HashMap<u16, u16>,
 ) {
     let mut i = 0;
+    let mut assigned = 0usize;
     while i < w_array.len() {
+        if assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return;
+        }
         let start_cid = match &w_array[i] {
             Object::Integer(n) => *n as u16,
             Object::Real(n) => *n as u16,
@@ -501,12 +565,14 @@ pub(crate) fn parse_cid_w_array(
             Object::Array(arr) => {
                 // [c [w1 w2 ...]] — consecutive widths starting at c
                 for (j, w_obj) in arr.iter().enumerate() {
-                    let w = match w_obj {
-                        Object::Integer(n) => *n as u16,
-                        Object::Real(n) => *n as u16,
-                        _ => continue,
-                    };
-                    widths.insert(start_cid + j as u16, w);
+                    if !assign_cid_width(
+                        widths,
+                        start_cid.wrapping_add(j as u16),
+                        w_obj,
+                        &mut assigned,
+                    ) {
+                        return;
+                    }
                 }
                 i += 1;
             }
@@ -514,12 +580,14 @@ pub(crate) fn parse_cid_w_array(
                 // Could be a reference to an array
                 if let Ok(Object::Array(arr)) = doc.get_object(*r) {
                     for (j, w_obj) in arr.iter().enumerate() {
-                        let w = match w_obj {
-                            Object::Integer(n) => *n as u16,
-                            Object::Real(n) => *n as u16,
-                            _ => continue,
-                        };
-                        widths.insert(start_cid + j as u16, w);
+                        if !assign_cid_width(
+                            widths,
+                            start_cid.wrapping_add(j as u16),
+                            w_obj,
+                            &mut assigned,
+                        ) {
+                            return;
+                        }
                     }
                     i += 1;
                 } else {
@@ -542,8 +610,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -561,8 +629,8 @@ pub(crate) fn parse_cid_w_array(
                         continue;
                     }
                 };
-                for cid in start_cid..=end {
-                    widths.insert(cid, w);
+                if !assign_cid_width_range(widths, start_cid, end, w, &mut assigned) {
+                    return;
                 }
                 i += 1;
             }
@@ -571,6 +639,45 @@ pub(crate) fn parse_cid_w_array(
             }
         }
     }
+}
+
+fn assign_cid_width(
+    widths: &mut HashMap<u16, u16>,
+    cid: u16,
+    w_obj: &Object,
+    assigned: &mut usize,
+) -> bool {
+    let w = match w_obj {
+        Object::Integer(n) => *n as u16,
+        Object::Real(n) => *n as u16,
+        _ => return true,
+    };
+    if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+        return false;
+    }
+    widths.insert(cid, w);
+    *assigned += 1;
+    true
+}
+
+fn assign_cid_width_range(
+    widths: &mut HashMap<u16, u16>,
+    start: u16,
+    end: u16,
+    w: u16,
+    assigned: &mut usize,
+) -> bool {
+    if start > end {
+        return true;
+    }
+    for cid in start..=end {
+        if *assigned >= crate::tounicode::MAX_CID_W_EXPANSION {
+            return false;
+        }
+        widths.insert(cid, w);
+        *assigned += 1;
+    }
+    true
 }
 
 /// Compute the width of a string in text space units,
@@ -1278,8 +1385,10 @@ pub(crate) fn extract_text_from_operand(
             // Fallback: try UTF-16BE then Latin-1
             if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
                 let utf16: Vec<u16> = bytes[2..]
-                    .chunks_exact(2)
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|chunk| u16::from_be_bytes(*chunk))
                     .collect();
                 let text = String::from_utf16_lossy(&utf16);
                 if text.contains('\u{FFFD}') {
@@ -1297,8 +1406,10 @@ pub(crate) fn extract_text_from_operand(
                 let nulls = bytes.iter().filter(|&&b| b == 0).count();
                 if nulls * 4 > bytes.len() {
                     let utf16: Vec<u16> = bytes
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_be_bytes(*chunk))
                         .collect();
                     let text = String::from_utf16_lossy(&utf16);
                     if score_text(&text) > 0 {
@@ -1616,6 +1727,17 @@ fn score_text(text: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn item_font_name_prefers_family_over_resource_tag() {
+        use super::item_font_name;
+        assert_eq!(item_font_name("F2", "ABCDEF+CMMI10"), "ABCDEF+CMMI10");
+        assert_eq!(item_font_name("T22", "Times-Roman"), "Times-Roman");
+        // Distiller CID-convention resources keep the resource name:
+        // is_cid_font keys on the C2_/C0_ prefix for micro-gap joining.
+        assert_eq!(item_font_name("C2_0", "ABCDEE+SimSun"), "C2_0");
+        assert_eq!(item_font_name("C0_1", "ABCDEE+MSMincho"), "C0_1");
+    }
 
     #[test]
     fn type3_scale_resolves_indirect_matrix_and_bbox_numbers() {
@@ -2312,5 +2434,49 @@ end",
         // A mapping to U+FFFD is not usable — extraction rejects it as an
         // invalid CMap result — so it must not clear the gid flag.
         assert!(gid_flagged(Some("<01> <FFFD>\n<02> <FFFD>")));
+    }
+
+    #[test]
+    fn parse_cid_w_array_range_and_consecutive() {
+        use super::parse_cid_w_array;
+        use lopdf::{Document, Object};
+        use std::collections::HashMap;
+
+        let doc = Document::new();
+        let mut widths = HashMap::new();
+        let w = vec![
+            Object::Integer(10),
+            Object::Integer(12),
+            Object::Integer(500),
+            Object::Integer(20),
+            Object::Array(vec![Object::Integer(100), Object::Integer(200)]),
+        ];
+        parse_cid_w_array(&doc, &w, &mut widths);
+        assert_eq!(widths.get(&10), Some(&500));
+        assert_eq!(widths.get(&11), Some(&500));
+        assert_eq!(widths.get(&12), Some(&500));
+        assert_eq!(widths.get(&20), Some(&100));
+        assert_eq!(widths.get(&21), Some(&200));
+    }
+
+    #[test]
+    fn parse_cid_w_array_repeated_full_ranges_stay_bounded() {
+        use super::parse_cid_w_array;
+        use crate::tounicode::MAX_CID_W_EXPANSION;
+        use lopdf::{Document, Object};
+        use std::collections::HashMap;
+
+        let doc = Document::new();
+        let mut widths = HashMap::new();
+        let mut w = Vec::new();
+        for _ in 0..5_000 {
+            w.push(Object::Integer(0));
+            w.push(Object::Integer(65535));
+            w.push(Object::Integer(500));
+        }
+        parse_cid_w_array(&doc, &w, &mut widths);
+        assert!(widths.len() <= MAX_CID_W_EXPANSION);
+        assert_eq!(widths.get(&0), Some(&500));
+        assert_eq!(widths.get(&65535), Some(&500));
     }
 }
